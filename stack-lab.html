@@ -1,0 +1,171 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>一条指令，两座栈</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f4f3ed;color:#172f32;font:16px/1.6 system-ui,sans-serif}main{max-width:1180px;margin:auto;padding:32px 4vw}small,label{font: bold 12px/1.5 monospace;letter-spacing:.08em;color:#526f70}header{border-top:5px solid #1d4547;padding-top:15px}h1{font-size:clamp(32px,5vw,60px);letter-spacing:-.06em;margin:8px 0}p{margin:6px 0 14px}.desk,article,details{border:1px solid #c7d1ca;background:#fffefa;border-radius:12px;padding:18px}.desk{background:#163d40;color:white;margin:20px 0}.desk small{color:#afddd4}button{font:inherit;cursor:pointer;border:1px solid #bccdc4;border-radius:7px;padding:6px 14px;background:white;color:#173e40}button:disabled{opacity:.45;cursor:default}#next{background:#aff0cd}.bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap}input{flex:1;min-width:80px;accent-color:#60ba98}.grid{display:grid;grid-template-columns:1.1fr 1fr 1fr;gap:12px}h2{font-size:21px;margin:4px 0 14px}.slot,pre{font:14px/1.7 Consolas,monospace;white-space:pre-wrap}.slot{padding:9px;margin:5px 0;background:#e6f4ed;border-left:4px solid #327a64}.kernel .slot{background:#fcf0df;border-color:#b87730}.empty{border:1px dashed #bdc8bf;padding:18px;color:#647774}.active{outline:2px solid #38856b}.kernel.active{outline-color:#b87730}pre{background:#203b40;color:#cbebe0;padding:12px;border-radius:8px}mark{display:block;background:#c2f0cf;color:#173e40}pre span{display:block}.note{color:#526765;font-size:14px}details{margin-top:14px}summary{cursor:pointer}kbd{font-family:monospace}a{color:#166956}@media(max-width:800px){.grid{grid-template-columns:1fr}.desk{margin:12px 0}main{padding:16px}}
+.lesson{background:#fffefa;border:1px solid #c7d1ca;border-radius:12px;padding:18px;margin-top:14px}.lesson h2{margin-bottom:4px}.decoded{display:grid;grid-template-columns:minmax(140px,.85fr) 1.4fr 1.4fr;gap:14px;padding:12px 0;border-top:1px solid #d7dfd9;align-items:start}.decoded code{color:#195948;font-weight:700;overflow-wrap:anywhere}.decoded small{display:block;margin-bottom:3px}.lesson details{padding:10px 14px}.lesson details p{margin-top:10px}@media(max-width:740px){.decoded{grid-template-columns:1fr;gap:6px}}
+</style><main><header><small>LINUX PERFORMANCE LAB　/　AArch64</small><h1>一条指令，两座栈</h1><p>跟随一个线程，看看它如何算出字母 A，再请内核把它写到终端。</p></header>
+<section class="desk"><small id="meter"></small><h2 id="title"></h2><p id="why"></p><div class="bar"><button id="prev">← 上一步</button><button id="next">下一步 →</button><button id="play">▶ 播放</button><input id="seek" aria-label="跳转步骤" type="range" min="0" max="13" value="0"></div></section>
+<div class="grid"><article><small>01　/　EXECUTION</small><h2>CPU 执行现场</h2><pre id="op"></pre><b id="mode"></b><p id="access"></p><small>终端输出</small><pre id="out"></pre></article><article id="user"><small>02　/　USER STACK</small><h2>用户栈</h2><div id="u"></div></article><article class="kernel" id="kern"><small>03　/　KERNEL STACK</small><h2>内核栈</h2><div id="k"></div></article></div>
+<section class="lesson" aria-labelledby="lessonTitle">
+  <h2 id="lessonTitle">逐行读指令</h2>
+  <p class="note">按从上到下的顺序读。为方便心算，假设 main 调用前 SP = 0x1000。下表只列出与当前操作有关的变化。</p>
+  <div id="decode"></div>
+  <details><summary>第一次读汇编？先认识寄存器和括号</summary>
+    <p>寄存器是 CPU 内部存放数值的位置。X0 到 X30 各有 64 位。W0 是 X0 的低 32 位，写 W0 也会把 X0 的高 32 位清零。程序可以在不同时刻给同一个寄存器安排不同用途。</p>
+    <p><code>add w9, w0, #1</code> 可以读成“把 W0 的值加 1，结果写进 W9”。<code>#</code> 表示指令里给出的常数。<code>[sp, #31]</code> 表示要访问的内存地址是 SP 加 31；地址和该处存放的字节可以有完全不同的值。</p>
+    <p>PC 表示指令位置。SP 保存当前栈顶地址。X29 是通用寄存器，调用约定给它的角色是帧指针（FP）。函数建立帧记录时用它保存这份记录的地址；硬件不会在调用时自动设置 X29。X30 也是通用寄存器，别名 LR（链接寄存器）。BL 自动把下一条指令的地址写入 X30，RET 默认跳到 X30 指向的位置。本例的函数返回值放在 X0。</p>
+  </details>
+</section><article style="margin-top:14px"><small>04　/　SOURCE</small><h2>C 伪代码对照</h2><pre id="src"></pre><span class="note">raw_write 表示内联的系统调用指令序列；为观察栈帧，本例让 emit 保留帧指针并保存 LR，实际编译结果随优化选项变化。展示的是教学轨迹，地址用符号表示，部分步骤合并多条指令。</span></article>
+<details><summary>读图指南：取指、数据访问、栈和堆</summary><p>PC 表示指令位置，SP 指向当前栈顶。代码和数据都在地址空间里；取指可以命中指令缓存，读写数据也可以命中缓存，不等于每次都访问 DRAM。寄存器加法的操作数就留在 CPU 内。</p><p>这里的两座栈都属于同一线程，向低地址增长。栈帧是一次函数调用使用的那段栈空间。堆则是另一块用来动态分配对象的空间，本例没有申请堆内存。回收栈帧只是移动栈指针，并不会逐字节擦除旧内容。</p><a href="https://codebrowser.dev/linux/linux/arch/arm64/kernel/entry.S.html">对照 Linux arm64 系统调用入口源码 ↗</a></details></main>
+<script>
+const steps = [
+  ['准备调用 emit', 'main 把参数 64 放入 W0。W0 是 X0 的低 32 位。', 'mov w0, #64', '仅写寄存器', 3],
+  ['跳到 emit', 'BL 把下一条指令的地址写入链接寄存器 X30（LR），再跳转到 emit。看看用户栈顶，它还在原处。', 'bl emit', 'X30 ← main 的返回位置', 3],
+  ['建立 32 字节的栈帧', 'SP 下移 32 字节。STP 把旧帧指针和 LR 写到新栈顶，随后 X29 指向这个帧。', 'stp x29, x30, [sp, #-32]!\nmov x29, sp', '写用户栈 · 两个 8 字节值', 0],
+  ['算出字符 A', 'W0 中的 64 加 1，结果 65 放入 W9。此时 c 的槽位还没有初始化。', 'add w9, w0, #1', '寄存器运算 · W9 = 65', 1],
+  ['将一个字节存入 c', 'STRB 取 W9 的低 8 位，把 0x41 写到 SP + 31 指向的位置。', 'strb w9, [sp, #31]', '写用户栈 · 1 字节', 1],
+  ['准备 write 参数', 'X0 是文件描述符，X1 指向 c，X2 是长度。Linux arm64 用 W8 传系统调用号，write 的编号是 64。', 'mov x0, #1\nadd x1, sp, #31\nmov x2, #1\nmov w8, #64', '计算地址 · X1 = &c', 2],
+  ['SVC 进入内核', '以 Linux 内核运行在 EL1 为例。CPU 把 SVC 后的地址记入 ELR_EL1，把用户状态记入 SPSR_EL1，跳到异常向量入口并选用 SP_EL1。', 'svc #0', '硬件更新寄存器 · 当前 SP 已指向内核栈', 2],
+  ['为异常现场预留空间', '入口汇编从内核 SP 减去 pt_regs 的大小。观察两座栈，只有内核栈顶在移动。', 'sub sp, sp, #PT_REGS_SIZE', '调整 SP · 槽位待填充', 2],
+  ['将用户现场保存到内核栈', '入口汇编保存通用寄存器，并记录用户 SP、返回 PC 和处理器状态。内核现在可以使用通用寄存器执行自己的代码。', 'stp x0, x1, [sp]\n…', '写内核栈 · pt_regs', 2],
+  ['处理 write', '内核分派到 write 路径。假设标准输出连到终端，写入成功。内核沿用户指针读取 c，自己的函数调用使用内核栈。', 'write(1, &c, 1)', '读用户栈 · 1 字节', 2],
+  ['记录系统调用结果', '写处理函数返回，终端收到 A。内核把成功写入的字节数放进现场中对应 X0 的槽位。', 'regs->regs[0] = 1', '写内核栈 · 返回值槽位', 2],
+  ['回到 emit', '出口汇编恢复用户寄存器、SP_EL0 和异常返回现场。ERET 恢复用户态，从 SVC 的下一条指令继续。此时 X0 = 1。', '恢复现场（多条指令）\neret', '读内核栈 · 回到 EL0', 2],
+  ['撤销 emit 栈帧', 'LDP 读回旧 X29 和 X30，然后把 SP 加回 32。c 的活动期结束。', 'ldp x29, x30, [sp], #32', '读用户栈 · 恢复 FP 和 LR', 2],
+  ['返回 main', 'RET 使用 X30 中的地址跳回 main。对照上一帧：取回 LR 的内存读取发生在 LDP 那一步。', 'ret', '寄存器跳转 · 用户 SP 保持原值', 3]
+];
+// One explanation per displayed line, in execution order.
+const explanations = [
+  [
+    ['把常数 64 放进第一个参数寄存器，准备传给 emit。', 'W0 ← 64，因此 X0 = 64。']
+  ],
+  [
+    ['保存回来的位置，然后跳到 emit 的第一条指令。', 'X30 ← BL 后一条指令的地址。PC ← emit 入口。SP 仍为 0x1000。假设 main 也使用帧指针，此时 X29 仍指向 main 的栈帧，具体地址未设定。']
+  ],
+  [
+    ['先算 0x1000 − 32 = 0x0FE0。从这个新地址开始依次存两个 8 字节值。叹号表示还要把新地址写回 SP。', 'SP ← 0x0FE0。旧 X29 存到 [0x0FE0]，X30 中的返回地址存到 [0x0FE8]。'],
+    ['emit 选这里作为自己栈帧的固定基准。旧 X29 已在上一行保存，现在把新栈顶地址复制到 X29。以后即使 SP 再移动，仍能通过 X29 找到帧记录。', 'X29 ← SP = 0x0FE0。此刻两者指向同一处。此后 SP 和 X29 可以独立变化。']
+  ],
+  [
+    ['取 W0 中的 64，加上常数 1。结果暂存在 CPU 内。', 'W9 ← 65（0x41），W0 仍为 64。']
+  ],
+  [
+    ['用 SP 加 31 得到 0x0FFF，把 W9 的最低一个字节写到这个地址，这就是变量 c。', 'SP 提供基地址 0x0FE0，W9 提供数据 0x41。变化发生在内存 [0x0FFF]。']
+  ],
+  [
+    ['准备第一个系统调用参数，文件描述符 1 表示标准输出。', 'X0 从 emit 的参数 64 变为 write 的参数 1。'],
+    ['计算 c 的地址，供内核稍后读取。', 'X1 ← SP + 31 = 0x0FFF。地址对应的字节是 0x41。'],
+    ['准备第三个参数，请求写出 1 个字节。', 'X2 ← 1。'],
+    ['选择 Linux arm64 的 write 系统调用。', 'W8 ← 64。这里的 64 是调用编号，和 emit 的参数恰好同值。']
+  ],
+  [
+    ['触发同步异常。#0 是 SVC 指令的立即数。Linux 从 W8 取得调用编号，从 X0、X1、X2 取得本例的参数。', 'ELR_EL1 ← SVC 后一条指令的位置。SPSR_EL1 ← 原处理器状态。PC 转到异常入口，当前 SP 选用 SP_EL1。']
+  ],
+  [
+    ['在内核栈上划出一块地方。PT_REGS_SIZE 表示保存寄存器现场所需的字节数。', '读当前内核 SP，减去现场大小，写回同一个 SP。用户栈顶仍在 0x0FE0。']
+  ],
+  [
+    ['把两个寄存器的值依次存到内核栈。方括号里的 SP 提供起始地址。', '[SP] ← X0（1），[SP + 8] ← X1（0x0FFF）。这条 STP 保留当前 SP。'],
+    ['省略号代表后续多条入口指令，它们陆续把其他用户寄存器和异常返回信息存入 pt_regs。', '其中保存的用户 SP 为 0x0FE0，保存的用户 PC 指向 SVC 的下一条指令。']
+  ],
+  [
+    ['内核处理过程简写。写处理路径根据用户提供的地址取出一个字节，交给终端。', '参数来自入口时的 X0 = 1、X1 = 0x0FFF、X2 = 1。内核后续函数可以重新使用这些寄存器。']
+  ],
+  [
+    ['这行 C 伪代码表示写入保存现场。写出 1 个字节，所以将 1 放入用户 X0 对应的内存槽位。', '现场里的 X0 原先也是 1，原意是标准输出；这次写入的 1 表示成功写出的长度。']
+  ],
+  [
+    ['多条出口指令从内核栈取回保存的值，准备返回用户态。', '用户 X0 ← 返回值 1。SP_EL0 ← 0x0FE0。ELR_EL1、SPSR_EL1 也恢复为本次返回所需的值。'],
+    ['按异常返回寄存器给出的位置和状态，继续执行 emit。', 'PC ← ELR_EL1。处理器恢复 EL0 状态，当前 SP 再次使用 SP_EL0。']
+  ],
+  [
+    ['先从当前栈顶连续读两个 8 字节值，再把 SP 加 32。括号外的 #32 表示访问后调整地址。', 'X29 ← [0x0FE0]，X30 ← [0x0FE8]。SP 从 0x0FE0 回到 0x1000。']
+  ],
+  [
+    ['使用刚刚取回的链接寄存器返回 main，继续执行 BL 后面的指令。', 'PC ← X30。X0 携带 emit 的返回值 1，SP 仍为 0x1000。']
+  ]
+];
+function renderExplanation(instructions, notes) {
+  const rows = instructions.split('\n').map((instruction, line) => {
+    const row = document.createElement('div');
+    row.className = 'decoded';
+    const opcode = document.createElement('code');
+    opcode.textContent = instruction;
+    row.append(opcode);
+    for (const [column, label] of ['这行做什么', '寄存器与数据'].entries()) {
+      const cell = document.createElement('div');
+      const heading = document.createElement('small');
+      heading.textContent = label;
+      cell.append(heading, notes[line][column]);
+      row.append(cell);
+    }
+    return row;
+  });
+  el('decode').replaceChildren(...rows);
+}
+const lines = ['long emit(int x) {', '    char c = x + 1;', '    return raw_write(1, &c, 1); }', 'int main(void) { emit(64); return 0; }'];
+const el = id => document.getElementById(id);
+const last = steps.length - 1;
+let index = 0;
+let timer;
+function slot(label) {
+  return '<div class="slot">' + label + '</div>';
+}
+function render() {
+  const [title, why, op, access, line] = steps[index];
+  renderExplanation(op, explanations[index]);
+  const kernel = index >= 6 && index <= 10;
+  const framed = index >= 2 && index <= 11;
+  for (const [id, value] of Object.entries({title, why, op, access})) el(id).textContent = value;
+  el('mode').textContent = kernel ? '● EL1 内核态' : '● EL0 用户态';
+  el('meter').textContent = 'Linux AArch64　·　第 ' + (index + 1) + ' / ' + steps.length + ' 步';
+  el('src').innerHTML = lines.map((s,i) => i === line ? '<mark>'+s+'</mark>' : '<span>'+s+'</span>').join('');
+  const user = ['main 栈帧'];
+  if (framed) user.push('emit　+31　c = ' + (index >= 4 ? '0x41（A）' : '待写入'), '+8　返回 main 的 LR', '+0　保存的 X29（main 的帧指针）');
+  el('u').innerHTML = user.map(slot).join('') + '<small>↓ 低地址　' + (kernel ? '用户栈顶' : '← SP') + '</small>';
+  const frames = [];
+  if (index >= 7 && kernel) frames.push(index === 7 ? '预留的 pt_regs 空间' : 'pt_regs · 用户现场');
+  if (index === 9) frames.push('系统调用分派帧', 'write 处理路径（多帧合并）');
+  el('k').innerHTML = frames.map(slot).join('') || '<div class="empty">此次调用无活动内核帧</div>';
+  if (kernel) el('k').innerHTML += '<small>↓ 低地址　← SP</small>';
+  el('user').classList.toggle('active', !kernel);
+  el('kern').classList.toggle('active', kernel);
+  el('out').textContent = index >= 10 ? 'A' : '（尚无输出）';
+  el('seek').value = index;
+  el('prev').disabled = index === 0;
+  el('next').disabled = index === last;
+}
+function stop() {
+  clearInterval(timer);
+  timer = null;
+  el('play').textContent = '▶ 播放';
+}
+function go(target) {
+  stop();
+  index = Math.max(0, Math.min(last, target));
+  render();
+}
+el('prev').onclick = () => go(index - 1);
+el('next').onclick = () => go(index + 1);
+el('seek').oninput = event => go(Number(event.target.value));
+el('play').onclick = () => {
+  if (timer) return stop();
+  if (index === last) go(0);
+  el('play').textContent = 'Ⅱ 暂停';
+  timer = setInterval(() => {
+    index++;
+    render();
+    if (index === last) stop();
+  }, 3200);
+};
+document.onkeydown = event => {
+  if (event.target.type === 'range') return;
+  if (['ArrowLeft','ArrowRight'].includes(event.key)) {
+    event.preventDefault();
+    go(index + (event.key === 'ArrowRight' ? 1 : -1));
+  }
+};
+render();
+</script></html>
+
+
+
